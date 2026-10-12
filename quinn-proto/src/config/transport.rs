@@ -35,6 +35,7 @@ pub struct TransportConfig {
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
+    pub(crate) adaptive_reordering: bool,
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
@@ -171,6 +172,18 @@ impl TransportConfig {
     /// as a factor of RTT
     pub fn time_threshold(&mut self, value: f32) -> &mut Self {
         self.time_threshold = value;
+        self
+    }
+
+    /// Whether to widen the packet and time thresholds when a loss is proven spurious
+    ///
+    /// When a packet declared lost is acknowledged after all, the path reordered it further than
+    /// the thresholds allowed. With this enabled, both thresholds grow to cover the reordering
+    /// observed (the packet threshold up to 300), and return to their configured values after 16
+    /// congestion events with no further spurious loss. Genuine losses on a reordering path are
+    /// then detected later, by up to the observed reordering delay.
+    pub fn adaptive_reordering(&mut self, value: bool) -> &mut Self {
+        self.adaptive_reordering = value;
         self
     }
 
@@ -390,6 +403,7 @@ impl Default for TransportConfig {
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
+            adaptive_reordering: false,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
@@ -428,6 +442,7 @@ impl fmt::Debug for TransportConfig {
             send_fairness,
             packet_threshold,
             time_threshold,
+            adaptive_reordering,
             initial_rtt,
             initial_mtu,
             min_mtu,
@@ -458,6 +473,7 @@ impl fmt::Debug for TransportConfig {
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
+            .field("adaptive_reordering", adaptive_reordering)
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)

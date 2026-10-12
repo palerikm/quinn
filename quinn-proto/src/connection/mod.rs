@@ -60,6 +60,8 @@ mod packet_crypto;
 use packet_crypto::{PrevCrypto, ZeroRttCrypto};
 
 mod paths;
+
+mod reorder;
 pub use paths::RttEstimator;
 use paths::{PathData, PathResponses};
 
@@ -1515,7 +1517,7 @@ impl Connection {
             }
         };
 
-        if self.detect_spurious_loss(&ack, space) {
+        if self.detect_spurious_loss(now, &ack, space) {
             self.stats.path.spurious_congestion_events += 1;
             self.path.congestion.on_spurious_congestion_event();
         }
@@ -1614,13 +1616,16 @@ impl Connection {
         Ok(())
     }
 
-    fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId) -> bool {
+    fn detect_spurious_loss(&mut self, now: Instant, ack: &frame::Ack, space: SpaceId) -> bool {
         let lost_packets = &mut self.spaces[space].lost_packets;
 
         if lost_packets.is_empty() {
             return false;
         }
 
+        // The same horizon `drain_lost_packets` forgets lost packets at, so no spurious loss we
+        // can observe is older than this anyway
+        let max_loss_delay = 2 * self.path.rtt.pto_base();
         for range in ack.iter() {
             let spurious_losses: Vec<u64> = lost_packets
                 .range(range.clone())
@@ -1629,7 +1634,16 @@ impl Connection {
                 .collect();
 
             for pn in spurious_losses {
-                lost_packets.remove(&pn);
+                let Some(info) = lost_packets.remove(&pn) else {
+                    continue;
+                };
+                if self.config.adaptive_reordering {
+                    self.path.reorder.on_spurious_loss(
+                        info.largest_acked.saturating_sub(pn),
+                        now.saturating_duration_since(info.time_sent),
+                        max_loss_delay,
+                    );
+                }
             }
         }
 
@@ -1761,10 +1775,14 @@ impl Connection {
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let mut loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let mut packet_threshold = self.config.packet_threshold as u64;
+        if self.config.adaptive_reordering {
+            loss_delay = self.path.reorder.loss_delay(loss_delay);
+            packet_threshold = self.path.reorder.packet_threshold(packet_threshold);
+        }
 
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
-        let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
@@ -1870,6 +1888,7 @@ impl Connection {
                     packet,
                     LostPacket {
                         time_sent: info.time_sent,
+                        largest_acked: largest_acked_packet,
                     },
                 );
             }
@@ -1887,6 +1906,7 @@ impl Connection {
 
             if lost_ack_eliciting {
                 self.stats.path.congestion_events += 1;
+                self.path.reorder.on_congestion_event();
                 self.path.congestion.on_congestion_event(
                     now,
                     largest_lost_sent,
