@@ -63,8 +63,12 @@ impl ReorderAdapter {
     ) {
         self.events_since_spurious = 0;
         // Tolerate the observed displacement: the packet was lost at `displacement`, so the
-        // threshold must exceed it.
-        let packets = displacement.saturating_add(1).min(MAX_PACKET_THRESHOLD);
+        // threshold must exceed it. The eighth of margin covers the next reordering being a
+        // little deeper, e.g. by a packet number skipped in between.
+        let packets = displacement
+            .saturating_add(displacement / 8)
+            .saturating_add(1)
+            .min(MAX_PACKET_THRESHOLD);
         self.packet_threshold = cmp::max(self.packet_threshold, packets);
         // Leave an eighth of margin, as RFC 9002's default time threshold does over the RTT.
         let delay = cmp::min(age + age / 8, max_loss_delay);
@@ -103,11 +107,19 @@ mod tests {
     fn spurious_loss_widens_both_thresholds() {
         let mut r = ReorderAdapter::default();
         r.on_spurious_loss(40, 16 * MS, 100 * MS);
-        assert_eq!(r.packet_threshold(3), 41);
+        assert_eq!(r.packet_threshold(3), 46);
         assert_eq!(r.loss_delay(MS), 18 * MS);
         // Never narrower than configured
         assert_eq!(r.packet_threshold(64), 64);
         assert_eq!(r.loss_delay(50 * MS), 50 * MS);
+    }
+
+    /// The next reordering may be a packet deeper, e.g. when the sender skips a packet number
+    #[test]
+    fn a_slightly_deeper_reordering_is_still_covered() {
+        let mut r = ReorderAdapter::default();
+        r.on_spurious_loss(9, 2 * MS, 100 * MS);
+        assert!(r.packet_threshold(3) > 10);
     }
 
     #[test]
@@ -115,7 +127,7 @@ mod tests {
         let mut r = ReorderAdapter::default();
         r.on_spurious_loss(40, 16 * MS, 100 * MS);
         r.on_spurious_loss(5, 2 * MS, 100 * MS);
-        assert_eq!(r.packet_threshold(3), 41);
+        assert_eq!(r.packet_threshold(3), 46);
         assert_eq!(r.loss_delay(MS), 18 * MS);
     }
 
@@ -134,7 +146,7 @@ mod tests {
         for _ in 1..RESET_AFTER_CONGESTION_EVENTS {
             r.on_congestion_event();
         }
-        assert_eq!(r.packet_threshold(3), 41, "reset one event early");
+        assert_eq!(r.packet_threshold(3), 46, "reset one event early");
         r.on_congestion_event();
         assert_eq!(r.packet_threshold(3), 3);
         assert_eq!(r.loss_delay(MS), MS);
@@ -149,6 +161,6 @@ mod tests {
         }
         r.on_spurious_loss(10, 4 * MS, 100 * MS);
         r.on_congestion_event();
-        assert_eq!(r.packet_threshold(3), 41);
+        assert_eq!(r.packet_threshold(3), 46);
     }
 }
