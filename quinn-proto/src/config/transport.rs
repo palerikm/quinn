@@ -179,8 +179,9 @@ impl TransportConfig {
     ///
     /// When a packet declared lost is acknowledged after all, the path reordered it further than
     /// the thresholds allowed. With this enabled, both thresholds grow to cover the reordering
-    /// observed (the packet threshold up to 300), and return to their configured values after 16
-    /// congestion events with no further spurious loss. Genuine losses on a reordering path are
+    /// observed (the packet threshold up to 300). The learned values are halved, back towards the
+    /// configured ones, only once 16 congestion events pass with no spurious loss proven for the
+    /// lost-packet horizon (2 PTO), so they hold while proofs keep arriving. Genuine losses on a reordering path are
     /// then detected later, by up to the observed reordering delay.
     pub fn adaptive_reordering(&mut self, value: bool) -> &mut Self {
         self.adaptive_reordering = value;

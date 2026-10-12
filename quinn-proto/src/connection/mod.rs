@@ -1639,6 +1639,7 @@ impl Connection {
                 };
                 if self.config.adaptive_reordering {
                     self.path.reorder.on_spurious_loss(
+                        now,
                         info.largest_acked.saturating_sub(pn),
                         now.saturating_duration_since(info.time_sent),
                         max_loss_delay,
@@ -1906,7 +1907,9 @@ impl Connection {
 
             if lost_ack_eliciting {
                 self.stats.path.congestion_events += 1;
-                self.path.reorder.on_congestion_event();
+                // Losses not proven spurious within the lost-packet horizon never will be
+                let quiet = 2 * self.path.rtt.pto_base();
+                self.path.reorder.on_congestion_event(now, quiet);
                 self.path.congestion.on_congestion_event(
                     now,
                     largest_lost_sent,
