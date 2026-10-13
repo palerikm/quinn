@@ -10,9 +10,9 @@
 //! declared lost, and how old it was when its ACK arrived. [`ReorderAdapter`] widens both
 //! thresholds to cover what was observed. It narrows them again only once the path has gone
 //! quiet: [`DECAY_AFTER_CONGESTION_EVENTS`] congestion events with no spurious loss proven for
-//! the whole lost-packet horizon, after which the learned values are halved. Proofs arrive after
-//! the congestion events they disprove, so counting events alone would discard what was learned
-//! on exactly the paths that reorder most.
+//! the whole lost-packet [`horizon`], after which the learned values are halved, at most once per
+//! horizon. Proofs arrive after the congestion events they disprove, so counting events alone
+//! would discard what was learned on exactly the paths that reorder most.
 //!
 //! Prior art: TCP RACK (RFC 8985 §6.2) widens its reordering window when a DSACK shows a
 //! retransmission was spurious and resets it after 16 loss recoveries; Linux TCP raises its
@@ -34,6 +34,17 @@ pub(super) const DECAY_AFTER_CONGESTION_EVENTS: u32 = 16;
 /// A learned loss delay below this is dropped rather than halved further
 const MIN_LEARNED_LOSS_DELAY: Duration = Duration::from_millis(1);
 
+/// How long a declared loss can still be proven spurious: the lost-packet horizon
+///
+/// Lost packets are forgotten after 2 PTO. On a path whose RTT is far below its reordering (a
+/// sub-millisecond link reordering by tens of milliseconds) the ACK that proves a loss spurious
+/// arrives long after that, so with 2 PTO alone the record is gone before its proof (nothing is
+/// learned) and every congestion event looks quiet (what was learned decays at once). The horizon
+/// is therefore also at least twice the loss delay in force.
+pub(super) fn horizon(two_pto: Duration, loss_delay_in_force: Duration) -> Duration {
+    cmp::max(two_pto, 2 * loss_delay_in_force)
+}
+
 /// Per-path reordering tolerance learned from spurious losses
 #[derive(Debug, Default, Clone)]
 pub(super) struct ReorderAdapter {
@@ -45,6 +56,8 @@ pub(super) struct ReorderAdapter {
     events_since_spurious: u32,
     /// When the last spurious loss was proven
     last_proof: Option<Instant>,
+    /// When the learned values were last halved
+    last_decay: Option<Instant>,
 }
 
 impl ReorderAdapter {
@@ -92,18 +105,23 @@ impl ReorderAdapter {
     /// the path is taken to reorder less than it did and the learned values are halved; a few
     /// such periods in a row bring the configured thresholds back. While proofs keep arriving,
     /// however late, nothing decays.
+    ///
+    /// At most one halving per horizon: the quiet window counts from the last proof or the last
+    /// halving, whichever is later. A halving shrinks the loss delay in force and with it the
+    /// horizon, so without that a burst of congestion events would halve again and again, each
+    /// against a shorter window, and wipe what was learned in one go.
     pub(super) fn on_congestion_event(&mut self, now: Instant, quiet: Duration) {
         if self.packet_threshold == 0 && self.loss_delay.is_zero() {
             return;
         }
         self.events_since_spurious = self.events_since_spurious.saturating_add(1);
-        let quiet_long_enough = self
-            .last_proof
+        let quiet_long_enough = cmp::max(self.last_proof, self.last_decay)
             .is_none_or(|t| now.saturating_duration_since(t) >= quiet);
         if self.events_since_spurious < DECAY_AFTER_CONGESTION_EVENTS || !quiet_long_enough {
             return;
         }
         self.events_since_spurious = 0;
+        self.last_decay = Some(now);
         self.packet_threshold /= 2;
         self.loss_delay /= 2;
         if self.loss_delay < MIN_LEARNED_LOSS_DELAY {
@@ -199,9 +217,10 @@ mod tests {
         let mut r = ReorderAdapter::default();
         let t0 = Instant::now();
         r.on_spurious_loss(t0, 40, 16 * MS, 100 * MS);
-        let later = t0 + QUIET;
-        for _ in 0..8 * DECAY_AFTER_CONGESTION_EVENTS {
-            r.on_congestion_event(later, QUIET);
+        for period in 1..=8 {
+            for _ in 0..DECAY_AFTER_CONGESTION_EVENTS {
+                r.on_congestion_event(t0 + period * QUIET, QUIET);
+            }
         }
         assert_eq!(r.packet_threshold(3), 3);
         assert_eq!(r.loss_delay(MS), MS);
@@ -219,5 +238,46 @@ mod tests {
         r.on_spurious_loss(later, 10, 4 * MS, 100 * MS);
         r.on_congestion_event(later + QUIET, QUIET);
         assert_eq!(r.packet_threshold(3), 46);
+    }
+
+    /// The cascade the guard prevents: each halving shrinks the horizon the next one waits for,
+    /// so a burst of events within one horizon must halve once, not repeatedly
+    #[test]
+    fn at_most_one_halving_per_horizon() {
+        let mut r = ReorderAdapter::default();
+        let t0 = Instant::now();
+        r.on_spurious_loss(t0, 40, 16 * MS, 100 * MS);
+        for _ in 0..10 * DECAY_AFTER_CONGESTION_EVENTS {
+            r.on_congestion_event(t0 + QUIET, QUIET);
+        }
+        assert_eq!(
+            (r.packet_threshold(3), r.loss_delay(MS)),
+            (23, 9 * MS),
+            "halved once"
+        );
+        for _ in 0..10 * DECAY_AFTER_CONGESTION_EVENTS {
+            r.on_congestion_event(t0 + QUIET + QUIET / 2, QUIET);
+        }
+        assert_eq!(
+            (r.packet_threshold(3), r.loss_delay(MS)),
+            (23, 9 * MS),
+            "halved again within one horizon"
+        );
+        for _ in 0..DECAY_AFTER_CONGESTION_EVENTS {
+            r.on_congestion_event(t0 + 2 * QUIET, QUIET);
+        }
+        assert_eq!(
+            r.packet_threshold(3),
+            11,
+            "the next horizon may halve again"
+        );
+    }
+
+    /// On a sub-millisecond path 2 PTO is a couple of milliseconds while a 20 ms reordering
+    /// proves its loss 20 ms later
+    #[test]
+    fn horizon_covers_the_loss_delay_in_force() {
+        assert_eq!(horizon(2 * MS, 20 * MS), 40 * MS);
+        assert_eq!(horizon(50 * MS, 20 * MS), 50 * MS);
     }
 }

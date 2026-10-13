@@ -1617,15 +1617,15 @@ impl Connection {
     }
 
     fn detect_spurious_loss(&mut self, now: Instant, ack: &frame::Ack, space: SpaceId) -> bool {
+        // The same horizon `drain_lost_packets` forgets lost packets at, so no spurious loss we
+        // can observe is older than this anyway
+        let max_loss_delay = self.lost_packet_horizon();
         let lost_packets = &mut self.spaces[space].lost_packets;
 
         if lost_packets.is_empty() {
             return false;
         }
 
-        // The same horizon `drain_lost_packets` forgets lost packets at, so no spurious loss we
-        // can observe is older than this anyway
-        let max_loss_delay = 2 * self.path.rtt.pto_base();
         for range in ack.iter() {
             let spurious_losses: Vec<u64> = lost_packets
                 .range(range.clone())
@@ -1658,12 +1658,32 @@ impl Connection {
     /// Drain lost packets that we reasonably think will never arrive
     ///
     /// The current criterion is copied from `msquic`:
-    /// discard packets that were sent earlier than 2 probe timeouts ago.
+    /// discard packets that were sent earlier than 2 probe timeouts ago. With adaptive reordering,
+    /// see [`Self::lost_packet_horizon`].
     fn drain_lost_packets(&mut self, now: Instant, space: SpaceId) {
-        let two_pto = 2 * self.path.rtt.pto_base();
+        let horizon = self.lost_packet_horizon();
 
         let lost_packets = &mut self.spaces[space].lost_packets;
-        lost_packets.retain(|_pn, info| now.saturating_duration_since(info.time_sent) <= two_pto);
+        lost_packets.retain(|_pn, info| now.saturating_duration_since(info.time_sent) <= horizon);
+    }
+
+    /// How long a lost packet is remembered, so that a late ACK can still prove it spurious
+    ///
+    /// 2 PTO, but with adaptive reordering never less than twice the loss delay in force; see
+    /// [`reorder::horizon`].
+    fn lost_packet_horizon(&self) -> Duration {
+        let two_pto = 2 * self.path.rtt.pto_base();
+        if !self.config.adaptive_reordering {
+            return two_pto;
+        }
+        let computed = cmp::max(
+            self.path
+                .rtt
+                .conservative()
+                .mul_f32(self.config.time_threshold),
+            TIMER_GRANULARITY,
+        );
+        reorder::horizon(two_pto, self.path.reorder.loss_delay(computed))
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -1908,7 +1928,7 @@ impl Connection {
             if lost_ack_eliciting {
                 self.stats.path.congestion_events += 1;
                 // Losses not proven spurious within the lost-packet horizon never will be
-                let quiet = 2 * self.path.rtt.pto_base();
+                let quiet = self.lost_packet_horizon();
                 self.path.reorder.on_congestion_event(now, quiet);
                 self.path.congestion.on_congestion_event(
                     now,
